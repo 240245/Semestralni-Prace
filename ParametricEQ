@@ -1,0 +1,367 @@
+import inspect
+import math
+import matplotlib.pyplot as plt
+import nablafx.processors as proc
+import numpy as np
+import torch
+import torch.nn as nn
+
+
+#1. NEPOSKOZENY SIGNAL
+fs = 48000           #Vzorkovaci Frekvence [Hz]
+duration = 1.0       #Delka Signalu [s]
+f = 440.0            #Frekvence [Hz] (Ton A4)
+t = np.linspace(0, duration, int(fs * duration), endpoint=False) #Casový Vektor
+    #np.linearspace - rovnomerne rozlozeni hodnot mezi 0s a duration (1s)
+    #endpoint=False - nezahrnuje posledni bod (1s)
+    #vzorky 0-4799
+# cista sinusovka
+clean = 0.8 * np.sin(2 * np.pi * f * t).astype(np.float32)
+
+# tensor tvar [batch, channels, time]
+clean_tensor = torch.from_numpy(clean).unsqueeze(0).unsqueeze(0)
+print("clean_tensor shape:", clean_tensor.shape)
+            #torch.from_numpy(clean) - prevod z numpy pole na PyThorch tenzor
+            #.unsqueeze(0).unsqueeze(0) - prida dimenze batch a chanel
+            #dimenze batch - 1 = jedna sada signalu
+            #dimenze chanel - 1 = monokanal, 2 = stereo kanal
+
+
+#zoom pro vizualizaci
+zoom_samples = 600
+t_zoom = t[:zoom_samples]
+clean_zoom = clean[:zoom_samples]
+
+
+#2. REFERENCNI FILTR = ParametricEQ s pevnymi parametry
+
+print("ParametricEQ signature:")
+print(inspect.signature(proc.ParametricEQ))
+
+
+model = proc.ParametricEQ(
+    sample_rate=float(fs),#vzorkovaci frekvence
+    min_gain_db=-12.0,#rozsahy zesileni, zeslabeni v dB
+    max_gain_db=12.0,
+    min_q_factor=0.1,#rozsah sirky pasem
+    max_q_factor=10.0,
+    control_type="static",#parametri jsou konstanti v case a nemeni se po vzorcich
+)
+
+print("ParametricEQ (referenční architektura) inicializován:")#vypis modelu
+print(model)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+#vstup a cil na spravnem zarizeni
+x_train = clean_tensor.to(device)  # vstup: cisty signal
+
+#kolik parametru EQ ceka
+control_channels = model.num_control_params  # = 15
+print("ParametricEQ očekává control_channels =", control_channels)
+
+# REFERENCNI PARAMETRY
+#hodnoty jsou v normalizovaném rozsahu (0, 1), denormalizace se udela uvnitř EQ
+#zvolime sadu, aby filtr byl viditelne zkresleny, ale ne extremni
+ref_control = torch.tensor(
+    [[[0.7, 0.3, 0.5,   # low-shelf (gain, cutoff, Q)
+       0.6, 0.2, 0.4,   # band0
+       0.3, 0.5, 0.7,   # band1
+       0.4, 0.7, 0.6,   # band2
+       0.2, 0.6, 0.5]]],  # high-shelf
+    dtype=torch.float32,
+    device=device,
+).permute(0, 2, 1)  # -> [1, 15, 1]
+
+print("ref_control shape:", ref_control.shape)
+
+#spocitame referencní (cilovy) signal
+with torch.no_grad():
+    y_target, ref_param_dict = model(x_train, ref_control, train=False)
+
+print("y_target shape:", y_target.shape)
+
+# pro graf – referencni signal
+y_target_np = y_target.squeeze().cpu().numpy()
+y_target_zoom = y_target_np[:zoom_samples]
+
+plt.figure(figsize=(10, 4))
+plt.plot(t_zoom, clean_zoom, label="Čistý signál", linestyle="--")
+plt.plot(t_zoom, y_target_zoom,
+         label="Referenční EQ (cílový signál)",
+         alpha=0.8)
+plt.xlabel("Čas [s]")
+plt.ylabel("Amplituda")
+plt.title("Čistý vs referenčně ekvalizovaný signál (zoom)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+#3. TRENOVANY EQ – STEJNY ParametricEQ, ale s ucicimi se parametry
+
+
+# raw parametry (ktere se budou trenovat), ktere pak zmapujeme do (0,1) pres sigmoid
+raw_control = nn.Parameter(
+    torch.zeros_like(ref_control)
+)
+
+def get_control_full():
+
+    # Vrati normalizovane control parametry v rozsahu (0, 1),
+    # tvar [B, control_channels, 1], jak ocekava ParametricEQ
+    # pro control_type='static'.
+
+    control_normalized = torch.sigmoid(raw_control)  # (0, 1)
+    # expand pro pripad vetsiho batch – tady B = 1
+    B = x_train.shape[0]
+    return control_normalized.expand(B, control_channels, 1)
+
+# sanity-check pred treninkem
+with torch.no_grad():#vypnuti pocitani gradientu
+    control_full_init = get_control_full()#nastaveni aktualnich parametru
+    y_init, _ = model(x_train, control_full_init, train=False)
+
+y_init_np = y_init.squeeze().cpu().numpy()
+y_init_zoom = y_init_np[:zoom_samples]
+
+plt.figure(figsize=(10, 4))
+plt.plot(t_zoom, clean_zoom, label="Čistý signál", linestyle="--")
+plt.plot(t_zoom, y_target_zoom,
+         label="Referenční EQ (cílový)",
+         alpha=0.7)
+plt.plot(t_zoom, y_init_zoom,
+         label="Trénovaný EQ (před tréninkem)",
+         alpha=0.7)
+plt.xlabel("Čas [s]")
+plt.ylabel("Amplituda")
+plt.title("Čistý, referenční a počáteční modelovaný signál (zoom)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+#4. LOSS FUNKCE
+# definice casove MSE(mean square error)
+mse_loss = nn.MSELoss()
+#Ztrata v kmitoctu
+def fft_loss(y_pred, y_true):
+
+     # FFT loss: MSE mezi spektry  v kmitoctove oblasti.
+    # tvar: [batch, channels, samples]
+    # FFT pres casovou osuh, channels, samples].
+
+    Y_pred = torch.fft.rfft(y_pred, dim=-1)
+    Y_true = torch.fft.rfft(y_true, dim=-1)
+     # Jedna se o komplexnicislo, ale nas zajima modul
+    mag_pred = torch.abs(Y_pred)
+    mag_true = torch.abs(Y_true)
+
+    return torch.mean((mag_pred - mag_true) ** 2)
+ #rozdil, umocneni, prumer =  vypocet chyby(fft loss)
+#Ztrata v case
+def stft_loss(y_pred, y_true, n_fft=2048, hop_length=512):
+    # STFT loss pro multi-channel
+    # Porovnava modul STFT pres vsechny kanaly a batch.
+    # Ocekava tvar [batch, channels, time].
+    # Vraci jedno cislo (scalar).
+
+    # y_pred, y_true: [B, C, T]
+    B_, C_, T_ = y_pred.shape
+    # Slouceni batch a kanaly do jedne dimenze:
+    # [B, C, T] -> [B*C, T]
+    y_pred_bc = y_pred.reshape(B_ * C_, T_)
+    y_true_bc = y_true.reshape(B_ * C_, T_)
+    # vytvorime Hannovo okno na spravnem device
+    window = torch.hann_window(n_fft, device=y_pred_bc.device)
+    # STFT pro vsechny (B*C) signaly najednou
+    S_pred = torch.stft(
+        y_pred_bc,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        window=window,
+        return_complex=True
+    )
+    S_true = torch.stft(
+        y_true_bc,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        window=window,
+        return_complex=True
+    )
+    # modully
+    mag_pred = torch.abs(S_pred)
+    mag_true = torch.abs(S_true)
+    # MSE pres vsechny dimenze (batch*channels, cas, frekvence)
+    loss = torch.mean((mag_pred - mag_true) ** 2)
+    return loss
+
+
+# vahy jednotlivych slozek lossu
+w_time = 1.0
+w_fft = 0.3
+w_stft = 0.3
+
+
+#5. OPTIMALIZATOR ADAM
+#tady trénujeme jen raw_control
+
+optimizer = torch.optim.Adam(
+    [raw_control],
+    lr=1e-3
+)
+
+
+model.train()#trenovaci rezim
+n_iters = 2000# počet kroku
+
+for step in range(n_iters):
+    optimizer.zero_grad()
+
+    control_full = get_control_full()
+    y_pred, _ = model(x_train, control_full, train=True)
+
+    # 1. casova MSE
+    loss_time = mse_loss(y_pred, y_target)
+    # 2.FFT loss
+    loss_f = fft_loss(y_pred, y_target)
+    #3. STFT loss
+    loss_s = stft_loss(y_pred, y_target)
+    # celkovy loss – kombinace
+    loss = w_time * loss_time + w_fft * loss_f + w_stft * loss_s
+
+    # zpetna propagace
+    loss.backward()
+    optimizer.step()
+
+    if step % 100 == 0:
+        print(
+            f"Krok {step:4d} | "
+            f"loss = {loss.item():.6f} | "
+            f"time = {loss_time.item():.6f}, "
+            f"FFT = {loss_f.item():.6f}, "
+            f"STFT = {loss_s.item():.6f}"
+        )
+# Vypis finalnich hodnot lossu
+print("\n--- Finální hodnoty po tréninku ---")
+print(f"Final step: {n_iters}")
+print(f"Final loss:     {loss.item():.6f}")
+print(f"Final time MSE: {loss_time.item():.6f}")
+
+
+if w_fft > 0:
+    print(f"Final FFT loss: {loss_f.item():.6f}")
+if w_stft > 0:
+    print(f"Final STFT loss: {loss_s.item():.6f}")
+
+#6 EVAL – cisty vs poskozeny vs model
+model.eval()
+
+with torch.no_grad():
+    control_full = get_control_full()
+    y_eval, _ = model(x_train, control_full, train=False)
+# na CPU + numpy kvuli grafu
+y_model_np = y_eval.squeeze().cpu().numpy()
+y_model_zoom = y_model_np[:zoom_samples]#stejny vyeez jako drive
+
+plt.figure(figsize=(10, 4))
+plt.plot(t_zoom, clean_zoom, label="Čistý signál", linestyle="--")
+plt.plot(t_zoom, y_target_zoom,
+         label="Referenční EQ (cílový)",
+         alpha=0.7)
+plt.plot(t_zoom, y_model_zoom,
+         label="Trénovaný EQ (po tréninku)",
+         alpha=0.7)
+
+plt.xlabel("Čas [s]")
+plt.ylabel("Amplituda")
+plt.title("Čistý, referenční a modelovaný signál (zoom)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+#7. POROVNANI ODEZEV (FIR vs natranovaný EQ)
+
+# delka impulzu / impulzni odezvy
+impulse_len = 4096
+
+# Jednotkovy impulz: [1, 0, 0, 0, ...]
+impulse = np.zeros(impulse_len, dtype=np.float32)
+impulse[0] = 1.0
+# tensor [B, C, T] = [1, 1, impulse_len]
+impulse_tensor = (
+    torch.from_numpy(impulse)
+    .unsqueeze(0)  # batch dim
+    .unsqueeze(0)  # channel dim
+    .to(device)
+)
+
+model.eval()
+
+with torch.no_grad():
+    # 1. Impulzni odezva referencniho EQ
+    y_imp_target, _ = model(impulse_tensor, ref_control.to(device), train=False)
+
+    # 2. Impulzni odezva trenovaného EQ
+    control_trained = get_control_full()  # [B, 15, 1]
+    y_imp_model, _ = model(impulse_tensor, control_trained, train=False)
+
+# Prevod na numpy
+h_target = y_imp_target.squeeze().cpu().numpy()   # referenční IR
+h_model = y_imp_model.squeeze().cpu().numpy()     # modelovaná IR
+
+# CASOVA ODEZVA (impulse response) 
+n_imp_zoom = 512  # kolik vzorků zobrazit v detailu
+
+plt.figure(figsize=(10, 4))
+plt.plot(h_target[:n_imp_zoom], label="Impulzní odezva – referenční EQ")
+plt.plot(h_model[:n_imp_zoom],
+         label="Impulzní odezva – trénovaný EQ",
+         alpha=0.8)
+plt.xlabel("Vzorek [n]")
+plt.ylabel("Amplituda")
+plt.title("Impulzní odezva referenčního a trénovaného EQ (zoom)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+#FREKVENCNI ODEZVA (amplitudova charakteristika)
+
+# RFFT obou impulznich odezev
+H_target = np.fft.rfft(h_target)
+H_model = np.fft.rfft(h_model)
+
+# frekvencni osa v Hz
+freqs = np.fft.rfftfreq(len(h_target), d=1.0/fs)
+
+# peevod na dB (pridame malou konstantu kvůli log(0))
+eps = 1e-12
+mag_target_db = 20 * np.log10(np.abs(H_target) + eps)
+mag_model_db = 20 * np.log10(np.abs(H_model) + eps)
+
+plt.figure(figsize=(10, 4))
+plt.plot(freqs, mag_target_db, label="Referenční EQ", alpha=0.9)
+plt.plot(freqs, mag_model_db, label="Trénovaný EQ", alpha=0.8)
+plt.xlim(0, fs / 2)  # 0 – Nyquist
+plt.xlabel("Frekvence [Hz]")
+plt.ylabel("Amplituda [dB]")
+plt.title("Frekvenční odezva referenčního a trénovaného EQ")
+plt.legend()
+plt.grid(True, which="both", ls=":")
+plt.tight_layout()
+plt.show()
+
+#8. ulozeni natrenovaneho modelu
+save_path = "parametric_eq_teaching_eq.pth"
+torch.save(
+    {
+        "model_state_dict": model.state_dict(),
+        "raw_control": raw_control.detach().cpu(),
+        "ref_control": ref_control.detach().cpu(),
+        "sample_rate": fs,
+    },
+    save_path
+)
+print(f"Model uložen do: {save_path}")
