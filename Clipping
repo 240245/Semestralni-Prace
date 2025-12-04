@@ -1,0 +1,291 @@
+import inspect
+import math
+import matplotlib.pyplot as plt
+import nablafx.processors as proc
+import numpy as np
+import torch
+import torch.nn as nn
+
+#1. NEPOSKOZENY SIGNAL
+fs = 48000          #Vzorkovaci Frekvence [Hz]
+duration = 1.0      #Delka Signalu [s]
+f = 440.0           #Frekvence [Hz] (Ton A4)
+t = np.linspace(0, duration, int(fs * duration), endpoint=False) #Casový Vektor
+    #np.linearspace - rovnomerne rozlozeni hodnot mezi 0s a duration (1s)
+    #endpoint=False - nezahrnuje posledni bod (1s)
+    #vzorky 0-4799
+
+# cista sinusovka
+clean = 0.8 * np.sin(2 * np.pi * f * t).astype(np.float32)
+    #Amplitudu nasobim 0.8 -> vyhnuti nezadoucimu clippingu
+    #np.sin(2*np.pi*f*t) - zakladni sinusovka
+    #.astype(np.float32) prevod dat na 32bit cislo (optimalizace, knihovny a modely prispusobeny)
+
+# tensor tvar [batch, channels, time]
+clean_tensor = torch.from_numpy(clean).unsqueeze(0).unsqueeze(0)
+print("clean_tensor shape:", clean_tensor.shape)
+    #torch.from_numpy(clean) - prevod z numpy pole na PyThorch tenzor
+    #.unsqueeze(0).unsqueeze(0) - prida dimenze batch a chanel
+            #dimenze batch - 1 = jedna sada signalu
+            #dimenze chanel - 1 = monokanal, 2 = stereo kanal
+
+
+
+#2. POSKOZENY SIGNAL (SOFT CLIP + DISTORTION)
+#soft clip
+drive = 2.0     #gain
+soft = (2.0 / np.pi) * np.arctan(drive * clean)  # měkké zakulacené vršky
+            #np.arctan() - soft clippi pres arctan
+            #(2.0 / np.pi) - normalizace rozsahu na -1 a 1
+
+#pridani distortionu (zkresleni)
+hf_mult = 9         #pridani harmonicke frekvence (9. harmonicka frekvence =  9*f)
+hf_gain = 0.07      #nasobeni amplitudy harmonicke frekcence
+hf = hf_gain * np.sin(2 * np.pi * f * hf_mult * t)
+distorted = (soft + hf).astype(np.float32)
+    #secteni soft clipu a distortionu
+
+# tensor tvar (zkresleny) [batch, channels, time]
+distorted_tensor = torch.from_numpy(distorted).unsqueeze(0).unsqueeze(0)
+print("distorted_tensor shape:", distorted_tensor.shape)
+
+# VYKRESLENI
+zoom_samples = 600                               #600 vzorku ≈ 12,5 ms
+t_zoom = t[:zoom_samples]                        #600 vzorku z casoveho vektoru
+clean_zoom = clean[:zoom_samples]                #600 vzorku z cisteho signalu
+distorted_zoom = distorted[:zoom_samples]        #600 vzorku z pozkozeneho signalu
+"""
+plt.figure(figsize=(10, 4))
+plt.plot(t_zoom, clean_zoom, label="Čistá sinusovka")
+plt.plot(t_zoom, distorted_zoom,
+         label="Zkreslená sinusovka",
+         alpha=0.8)                              #pruhlednost
+
+plt.xlabel("Čas [s]")
+plt.ylabel("Amplituda")
+plt.title("Porovnání čistého a zkresleného signálu (zoom)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+"""
+#3. MODEL Z NABLAFX – StaticMLPNonlinearity
+    #model je nelinearni a staticky
+print("StaticMLPNonlinearity signature:")
+print(inspect.signature(proc.StaticMLPNonlinearity))
+
+# inicializace modelu z NablAFx
+model = proc.StaticMLPNonlinearity(
+    sample_rate=float(fs),      #Predani vzorkovaci frekvence
+    hidden_dim=64,              #Pocet neuronu
+    num_layers=3,               #Pocet vrstev MLP = Multi Layer Perceptron
+    # ostatni parametry nechame v zakladu (w0_initial, pretrained, lr_multiplier)
+            #w0_initial     - nastaveni frekvence sinusu v SIREN siti
+            #pretrained     - nacteni natrenovany model (neni potreba)
+            #lr_multiplier  - nastaveni jine rychlosti u jednotlivych vrstev (neni potreba)
+)
+
+print("Model z NablAFx inicializován:", model)
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+x_in = clean_tensor.to(device) # Posilani cisteho signalu do modelu
+
+
+#control_params, musi byt None
+with torch.no_grad():
+    y_hat = model(x_in, None)
+#y_hat je tuple -> prvni prvek je audio tensor
+y_audio = y_hat[0]
+print("Výstup modelu tvar:", y_audio.shape)
+
+#4. Vykresleni do grafu (Cisty signal, Poskozeny signal, Pozkozeny signal z modelu)
+
+#prevod vystupu modelu na 1D numpy pole
+y_np = y_audio.squeeze().cpu().numpy()
+y_zoom = y_np[:zoom_samples]
+
+plt.figure(figsize=(10, 4))
+plt.plot(t_zoom, clean_zoom, label="Čistá sinusovka")
+plt.plot(t_zoom, distorted_zoom,
+         label="Zkreslená sinusovka (vstup do modelu)",
+         alpha=0.7)
+plt.plot(t_zoom, y_zoom,
+         label="Výstup modelu NablAFx",
+         alpha=0.7)
+
+plt.xlabel("Čas [s]")
+plt.ylabel("Amplituda")
+plt.title("Čistý, poškozený a modelovaný signál (zoom)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+#5. loss funkce a optimalizator
+
+# definice casove MSE(mean square error)
+mse_loss = nn.MSELoss()
+#Ztrata v kmitoctu
+def fft_loss(y_pred, y_true):
+
+ #FFT loss: MSE mezi spektry  v kmitoctove oblasti.
+    #tvar: [batch, channels, samples]
+    # FFT pres casovou osu
+    Y_pred = torch.fft.rfft(y_pred, dim=-1)
+    Y_true = torch.fft.rfft(y_true, dim=-1)
+    #Jedna se o komplexnicislo, ale nas zajima modul
+    mag_pred = torch.abs(Y_pred)
+    mag_true = torch.abs(Y_true)
+
+    return torch.mean((mag_pred - mag_true) ** 2)
+    #rozdil, umocneni, prumer =  vypocet chyby(fft loss)
+
+#Ztrata v case
+def stft_loss(y_pred, y_true, n_fft=2048, hop_length=512):
+
+    #STFT loss pro multi-channel
+    #Porovnava modul STFT pres vsechny kanaly a batch.
+    #Ocekava tvar [batch, channels, time].
+    #Vraci jedno cislo (scalar).
+
+    #y_pred, y_true: [B, C, T]
+    B, C, T = y_pred.shape
+
+    # Slouceni batch a kanaly do jedne dimenze:
+    # [B, C, T] -> [B*C, T]
+    y_pred_bc = y_pred.reshape(B * C, T)
+    y_true_bc = y_true.reshape(B * C, T)
+
+    # vytvorime Hannovo okno na spravnem device
+    window = torch.hann_window(n_fft, device=y_pred_bc.device)
+
+    # STFT pro vsechny (B*C) signaly najednou
+    S_pred = torch.stft(
+        y_pred_bc,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        window=window,
+        return_complex=True
+    )
+    S_true = torch.stft(
+        y_true_bc,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        window=window,
+        return_complex=True
+    )
+
+    #modully
+    mag_pred = torch.abs(S_pred)
+    mag_true = torch.abs(S_true)
+
+    # MSE pres vsechny dimenze (batch*channels, cas, frekvence)
+    loss = torch.mean((mag_pred - mag_true) ** 2)
+    return loss
+
+
+# vahy jednotlivych slozek lossu
+w_time = 1.0
+w_fft = 0.3
+w_stft = 0.3
+
+# Adam optimizer
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+#pripraveni vstupu a cilu na spravnem zarizeni
+x_train = clean_tensor.to(device)        # vstup: cisty signal
+y_target = distorted_tensor.to(device)   # cil: rucne poskozeny signal
+
+model.train()   #trenovaci rezim
+
+n_iters = 2000# počet kroku
+
+for step in range(n_iters):
+    optimizer.zero_grad()
+
+    # forward pruchod – BEZ no_grad, protoze trenujeme
+    y_hat = model(x_train, None)
+
+    # model z NablAFx casto vraci tuple -> vezmeme prvni prvek
+    if isinstance(y_hat, tuple):
+        y_pred = y_hat[0]
+    else:
+        y_pred = y_hat
+
+    #1. casova MSE
+    loss_time = mse_loss(y_pred, y_target)
+
+    #2.FFT loss
+    loss_f = fft_loss(y_pred, y_target)
+
+    #3. STFT loss
+    loss_s = stft_loss(y_pred, y_target)
+
+    #celkovy loss – kombinace
+    loss = w_time * loss_time + w_fft * loss_f + w_stft * loss_s
+
+    #zpetna propagace
+    loss.backward()
+    optimizer.step()
+
+    if step % 100 == 0:
+        print(
+            f"Krok {step:4d} | "
+            f"loss = {loss.item():.6f} | "
+            f"time = {loss_time.item():.6f}, "
+            f"FFT = {loss_f.item():.6f}, "
+            f"STFT = {loss_s.item():.6f}"
+        )
+
+# Vypis finalnich hodnot lossu
+
+print("\n--- Finální hodnoty po tréninku ---")
+print(f"Final step: {n_iters}")
+print(f"Final loss:     {loss.item():.6f}")
+print(f"Final time MSE: {loss_time.item():.6f}")
+
+
+if w_fft > 0:
+    print(f"Final FFT loss: {loss_f.item():.6f}")
+if w_stft > 0:
+    print(f"Final STFT loss: {loss_s.item():.6f}")
+
+#6 EVAL – cisty vs poskozeny vs model
+
+model.eval()
+
+with torch.no_grad():
+    y_hat = model(x_train, None)
+    if isinstance(y_hat, tuple):
+        y_pred = y_hat[0]
+    else:
+        y_pred = y_hat
+
+# na CPU + numpy kvuli grafu
+y_np = y_pred.squeeze().cpu().numpy()
+y_zoom = y_np[:zoom_samples]  #stejny vyeez jako drive
+
+plt.figure(figsize=(10, 4))
+plt.plot(t_zoom, clean_zoom, label="Čistý signál")
+plt.plot(t_zoom, distorted_zoom,
+         label="Poškozený signál (soft clipping)",
+         alpha=0.7)
+plt.plot(t_zoom, y_zoom,
+         label="Výstup modelu NablAFx (po tréninku)",
+         alpha=0.7)
+
+plt.xlabel("Čas [s]")
+plt.ylabel("Amplituda")
+plt.title("Čistý, poškozený a modelovaný signál (zoom)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+#7. ulozeni natrenovaneho modelu
+save_path = "static_mlp_nonlinearity_trained.pth"
+torch.save(model.state_dict(), save_path)
+print(f"Model uložen do: {save_path}")
+
