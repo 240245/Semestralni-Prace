@@ -194,7 +194,7 @@ def stft_loss(y_pred, y_true, n_fft=2048, hop_length=512):
 
 # vahy jednotlivych slozek lossu
 w_time = 1.0
-w_fft = 0.15   # trochu menší váha FFT, aby se to nesnažilo o nemožnou perfektní shodu
+w_fft = 0.15   
 w_stft = 0.15
 
 
